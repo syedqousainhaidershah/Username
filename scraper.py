@@ -89,6 +89,33 @@ class ProxyPoolManager:
         self._softbanned: Dict[str, float] = {}  # proxy -> ban_expiry
         self._idx = 0
         self._auto_fetch = False
+        self._split_direct_proxy = False  # When True: 50% Direct Scan / 50% Proxy Scan
+        self._force_mode = "auto"  # "direct", "proxy", "split", "auto"
+        self._req_counter = 0
+        self._direct_count = 0
+        self._proxy_count = 0
+
+    def set_split_mode(self, enabled: bool = True):
+        self._split_direct_proxy = enabled
+        if enabled:
+            self._force_mode = "split"
+        elif self._force_mode == "split":
+            self._force_mode = "auto"
+
+    def set_mode_direct(self):
+        self._force_mode = "direct"
+        self._split_direct_proxy = False
+
+    def set_mode_proxy(self):
+        self._force_mode = "proxy"
+        self._split_direct_proxy = False
+
+    def set_mode_auto(self):
+        self._force_mode = "auto"
+        self._split_direct_proxy = False
+
+    def get_pool_mode(self) -> str:
+        return self._force_mode
 
     def add_proxy(self, proxy_str: str) -> bool:
         p = str(proxy_str).strip()
@@ -139,8 +166,25 @@ class ProxyPoolManager:
         return c
 
     def get_proxy(self) -> Optional[str]:
-        if not self._proxies:
+        # 1. Direct Only Mode (100% Native Host IP)
+        if self._force_mode == "direct":
+            self._direct_count += 1
             return None
+
+        # 2. Split Mode (50% Direct / 50% Proxy)
+        if self._force_mode == "split" or self._split_direct_proxy:
+            self._req_counter += 1
+            if self._req_counter % 2 == 0 or not self._proxies:
+                self._direct_count += 1
+                return None
+
+        # 3. If no proxies available, fallback to Direct
+        if not self._proxies:
+            self._direct_count += 1
+            return None
+
+        # 4. Proxy Only or Auto Mode (with proxies present)
+        self._proxy_count += 1
         now = time.time()
         # Clean expired softbans
         expired = [p for p, t in self._softbanned.items() if now > t]
@@ -170,9 +214,145 @@ class ProxyPoolManager:
             "working": max(0, len(self._proxies) - active_banned),
             "soft_banned": active_banned,
             "proxies": self._proxies[:20],
+            "split_mode": self._split_direct_proxy,
+            "force_mode": self._force_mode,
+            "direct_checks": self._direct_count,
+            "proxy_checks": self._proxy_count,
         }
 
 _proxy_pool = ProxyPoolManager()
+
+def set_split_mode(enabled: bool = True):
+    """Enable or disable 50% Direct / 50% Proxy scanning mode."""
+    _proxy_pool.set_split_mode(enabled)
+    log.info(f"⚡ [Dual-Engine] 50% Direct / 50% Proxy mode: {'ENABLED' if enabled else 'DISABLED'}")
+
+def is_split_mode() -> bool:
+    return _proxy_pool._split_direct_proxy
+
+def set_mode_direct_only():
+    """Route 100% of requests through native host IP (no proxies)."""
+    _proxy_pool.set_mode_direct()
+    log.info("⚡ [ProxyPool] Switched to DIRECT ONLY mode (100% Native Host IP).")
+
+def set_mode_proxy_only():
+    """Route 100% of requests through verified proxy swarm (0% host IP, native IP resting)."""
+    _proxy_pool.set_mode_proxy()
+    log.info("🌐 [ProxyPool] Switched to PROXY SWARM mode (100% Verified Proxies, 0% Host IP).")
+
+def set_mode_auto():
+    _proxy_pool.set_mode_auto()
+    log.info("🔄 [ProxyPool] Switched to AUTO mode.")
+
+def get_pool_mode() -> str:
+    return _proxy_pool.get_pool_mode()
+
+FREE_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
+]
+
+async def auto_fetch_free_proxies(max_candidates: int = 150, concurrency: int = 30) -> int:
+    """Fetches candidate proxies from verified high-quality raw feeds, tests them against Fragment, and loads working ones into pool."""
+    log.info("🌐 [Auto-Proxy Fetcher] Pulling fresh candidates from verified feeds...")
+    candidates: List[str] = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    timeout = aiohttp.ClientTimeout(total=6)
+    
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        tasks = []
+        for src in FREE_PROXY_SOURCES:
+            async def _fetch_feed(url):
+                try:
+                    async with sess.get(url, headers=headers) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            matches = re.findall(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}\b", text)
+                            return matches
+                except Exception as e:
+                    log.debug(f"Proxy feed {url} error: {e}")
+                return []
+            tasks.append(_fetch_feed(src))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                candidates.extend(r)
+
+    if not candidates:
+        log.warning("⚠️ [Auto-Proxy Fetcher] No candidate proxies fetched from feeds.")
+        return 0
+
+    unique = list(set(candidates))
+    random.shuffle(unique)
+    sample = unique[:max_candidates]
+    log.info(f"🌐 [Auto-Proxy Fetcher] Testing {len(sample)} candidate proxies against Fragment...")
+
+    valid_proxies: List[str] = []
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _verify_proxy(p_str: str):
+        p_url = f"http://{p_str}"
+        try:
+            async with sem:
+                t = aiohttp.ClientTimeout(total=3.5)
+                async with aiohttp.ClientSession(timeout=t) as t_sess:
+                    async with t_sess.get("https://fragment.com/", headers={"User-Agent": random.choice(_USER_AGENTS)}, proxy=p_url) as r:
+                        if r.status == 200:
+                            valid_proxies.append(p_url)
+        except Exception:
+            pass
+
+    await asyncio.gather(*(_verify_proxy(p) for p in sample), return_exceptions=True)
+
+    if valid_proxies:
+        _proxy_pool.load_from_text("\n".join(valid_proxies))
+        log.info(f"✅ [Auto-Proxy Fetcher] Successfully injected {len(valid_proxies)} active proxies into pool! (Total in pool: {len(_proxy_pool._proxies)})")
+        return len(valid_proxies)
+    else:
+        log.info("ℹ️ [Auto-Proxy Fetcher] Candidate batch tested; maintaining existing proxy pool.")
+        return 0
+
+async def auto_fetch_proxies_loop(interval_mins: int = 8):
+    """Autonomous background daemon that periodically refreshes the proxy pool with verified proxies."""
+    log.info("🌐 [Auto-Proxy Daemon] Started background auto-proxy loop.")
+    while True:
+        try:
+            await auto_fetch_free_proxies()
+        except Exception as exc:
+            log.warning(f"Auto-proxy daemon iteration error: {exc}")
+        await asyncio.sleep(interval_mins * 60)
+
+async def reset_sessions():
+    """Safely reset all curl and aiohttp connection pools on engine/mode transitions."""
+    global _hash_workers
+    try:
+        await _direct_engine.close()
+    except Exception:
+        pass
+    for hw in list(_hash_workers.values()):
+        try:
+            if hw._curl_session is not None:
+                res = hw._curl_session.close()
+                if asyncio.iscoroutine(res):
+                    await res
+                hw._curl_session = None
+        except Exception:
+            pass
+    log.info("🔄 [Sessions] Network sessions and connection pools reset for duty transition.")
 
 # ── Circuit Breaker & Caching ────────────────────────────────────────────────
 _circuit_errors = 0
@@ -376,7 +556,7 @@ class _DirectEngine:
         if HAS_CURL_CFFI:
             try:
                 cs = await self._get_curl_session(proxy=proxy)
-                resp = await cs.get(url, headers={"User-Agent": agent, "Referer": "https://fragment.com/"}, timeout=8)
+                resp = await cs.get(url, headers={"User-Agent": agent, "Referer": "https://fragment.com/"}, timeout=8, proxy=proxy)
                 if resp.status_code == 429:
                     if proxy:
                         _proxy_pool.mark_softban(proxy, 60.0)
@@ -553,6 +733,7 @@ class _HashWorkerSession:
                     "Referer": "https://fragment.com/",
                 },
                 timeout=8,
+                proxy=proxy,
             )
             self.req_count += 1
 
@@ -756,7 +937,7 @@ async def debug_fetch(username: str, timeout: float = 10.0) -> dict:
         if HAS_CURL_CFFI:
             try:
                 cs = await _direct_engine._get_curl_session(proxy=proxy)
-                resp = await cs.get(url, headers={"User-Agent": agent, "Referer": "https://fragment.com/"}, timeout=timeout)
+                resp = await cs.get(url, headers={"User-Agent": agent, "Referer": "https://fragment.com/"}, timeout=timeout, proxy=proxy)
                 status_code = resp.status_code
                 html = resp.text
                 resp_url = str(resp.url)
@@ -924,8 +1105,7 @@ def set_auto_fetch_proxies(v: bool) -> None:
 def get_auto_fetch_proxies() -> bool:
     return _proxy_pool._auto_fetch
 
-async def auto_fetch_free_proxies():
-    pass
+# auto_fetch_free_proxies is fully implemented above with verified Fragment testing.
 
 def set_hash_requests_per_token(n: int) -> None:
     val = max(1, min(500, int(n)))

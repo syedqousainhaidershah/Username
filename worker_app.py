@@ -52,7 +52,8 @@ else:
 INITIAL_MODE  = os.environ.get("SCAN_MODE", "hash").lower()
 PORT          = int(float(os.environ.get("PORT", os.environ.get("SERVER_PORT", "7860"))))
 PING_INTERVAL = int(float(os.environ.get("PING_INTERVAL", "15")))
-N_WORKERS     = int(float(os.environ.get("FRAG_WORKERS", "20")))
+N_WORKERS     = int(float(os.environ.get("FRAG_WORKERS", "6" if "wisp" in WORKER_ID.lower() else "20")))
+SCAN_DELAY    = float(os.environ.get("SCAN_DELAY", "0.10" if "wisp" in WORKER_ID.lower() else "0.02"))
 DUTY_CYCLE_MINS = int(float(os.environ.get("DUTY_CYCLE", "30" if "blitz" in WORKER_ID.lower() else "0")))
 
 logging.basicConfig(
@@ -67,6 +68,15 @@ if INITIAL_MODE in ("direct", "direct_scan"):
     scraper.set_scan_mode("direct")
 else:
     scraper.set_scan_mode("hash")
+
+# Check Enzonic Heavy-Duty Dual-Engine mode (50% Direct / 50% Proxy)
+IS_ENZONIC_DUAL = ("enzonic" in WORKER_ID.lower() or os.environ.get("SPLIT_DIRECT_PROXY", "").lower() in ("true", "1", "yes"))
+if IS_ENZONIC_DUAL:
+    scraper.set_split_mode(True)
+    log.info("🚀 Enzonic Heavy-Duty Node active: 50% Direct Scan + 50% Rotating Proxy Scan enabled!")
+elif DUTY_CYCLE_MINS > 0:
+    scraper.set_mode_direct_only()
+    log.info(f"⚡ Blitz Alternating Duty Node active ({DUTY_CYCLE_MINS}m Direct IP ⇄ {DUTY_CYCLE_MINS}m Proxy Swarm)")
 
 # ── ZeroGPU / Gradio Anchor for Hugging Face Spaces ──────────────────────────
 try:
@@ -96,7 +106,7 @@ _STATE = {
     "last_upstream_ping": 0.0,
     "upstream_error": "",
     "duty_cycle_enabled": (DUTY_CYCLE_MINS > 0),
-    "duty_state": "scanning",
+    "duty_state": "direct_ip" if DUTY_CYCLE_MINS > 0 else "scanning",
     "cycle_switch_at": time.time() + (DUTY_CYCLE_MINS * 60 if DUTY_CYCLE_MINS > 0 else 999999999),
     "last_sentinel_ping": 0.0,
 }
@@ -114,6 +124,7 @@ _STATS = {
 
 _watchlist: List[str] = []
 _scan_queue: asyncio.Queue = asyncio.Queue()
+_queue_lock: Optional[asyncio.Lock] = None
 _worker_tasks: List[asyncio.Task] = []
 _recent_logs: List[dict] = []
 _recent_scan_events: deque = deque(maxlen=40)
@@ -144,20 +155,34 @@ async def _ping_main() -> Optional[dict]:
         return None
     try:
         sess = await _get_main_session()
+        p_stats = scraper._proxy_pool.stats()
+        d_state = _STATE.get("duty_state", "scanning")
+        if d_state == "proxy_swarm":
+            current_display_mode = f"proxy_swarm ({p_stats.get('working', 0)} active)"
+        elif d_state == "direct_ip":
+            current_display_mode = f"direct_ip ({scraper.get_scan_mode().upper()})"
+        elif scraper.is_split_mode():
+            current_display_mode = "Direct (50%) + Proxy (50%)"
+        else:
+            current_display_mode = scraper.get_scan_mode()
+
         payload = {
             "source": WORKER_ID,
             "worker_id": WORKER_ID,
             "checks": _STATS["checks"],
             "triggers": _STATS["triggers"],
             "speed": _STATS["speed"],
-            "mode": scraper.get_scan_mode(),
+            "mode": current_display_mode,
             "total": _STATS["watchlist_size"],
             "is_vip": False,
             "events": list(_recent_scan_events),
             "last_check": _STATS.get("last_check", ""),
             "last_trigger": _STATS.get("last_trigger", "None"),
-            "duty_state": _STATE.get("duty_state", "scanning"),
-            "cooldown_s": max(0, int(_STATE.get("cycle_switch_at", 0) - time.time())) if _STATE.get("duty_state") == "resting" else 0,
+            "duty_state": d_state,
+            "cooldown_s": max(0, int(_STATE.get("cycle_switch_at", 0) - time.time())) if _STATE.get("duty_cycle_enabled") else 0,
+            "direct_checks": p_stats.get("direct_checks", 0),
+            "proxy_checks": p_stats.get("proxy_checks", 0),
+            "active_proxies": p_stats.get("working", 0),
         }
         async with sess.post(f"{MAIN_URL}/worker_ping", json=payload) as resp:
             if resp.status == 200:
@@ -229,22 +254,28 @@ async def _sync_loop():
             last_check_count = _STATS["checks"]
             last_speed_time = now
 
-            # Duty cycle manager (e.g. Blitz 30m Scan / 30m Rest)
+            # Duty cycle manager (30m Direct IP ⇄ 30m Proxy Swarm 24/7 continuous scanning)
             if _STATE.get("duty_cycle_enabled"):
                 if now >= _STATE.get("cycle_switch_at", 0):
-                    if _STATE.get("duty_state") == "scanning":
-                        _STATE["duty_state"] = "resting"
+                    if _STATE.get("duty_state") in ("direct_ip", "scanning"):
+                        _STATE["duty_state"] = "proxy_swarm"
                         _STATE["cycle_switch_at"] = now + (DUTY_CYCLE_MINS * 60)
-                        log.info(f"⏸ Duty Cycle: Switching to RESTING for {DUTY_CYCLE_MINS}m cooldown...")
-                        _log_event(f"⏸ Duty Cycle: Cooldown started ({DUTY_CYCLE_MINS}m rest)", "info")
+                        scraper.set_mode_proxy_only()
+                        await scraper.reset_sessions()
+                        log.info(f"🌐 Duty Cycle: Switching to PROXY SWARM for {DUTY_CYCLE_MINS}m! Blitz Native IP is resting (0 requests).")
+                        _log_event(f"🌐 Duty Cycle: Proxy Swarm active ({DUTY_CYCLE_MINS}m - Native IP resting)", "info")
+                        if scraper._proxy_pool.stats().get("working", 0) < 10:
+                            asyncio.create_task(scraper.auto_fetch_free_proxies())
                     else:
-                        _STATE["duty_state"] = "scanning"
+                        _STATE["duty_state"] = "direct_ip"
                         _STATE["cycle_switch_at"] = now + (DUTY_CYCLE_MINS * 60)
-                        log.info(f"⚡ Duty Cycle: Waking up! Scanning for {DUTY_CYCLE_MINS}m...")
-                        _log_event(f"⚡ Duty Cycle: Scanning active ({DUTY_CYCLE_MINS}m)", "success")
+                        scraper.set_mode_direct_only()
+                        await scraper.reset_sessions()
+                        log.info(f"⚡ Duty Cycle: Blitz IP refreshed! Switching to NATIVE DIRECT IP for {DUTY_CYCLE_MINS}m...")
+                        _log_event(f"⚡ Duty Cycle: Native Direct IP active ({DUTY_CYCLE_MINS}m)", "success")
 
-                # If resting, run Sentinel Keep-Alive Pings to keep Main Bot & Workers awake!
-                if _STATE.get("duty_state") == "resting" and (now - _STATE.get("last_sentinel_ping", 0)) > 90:
+                # Sentinel Keep-Alive Pings to keep Main Bot & Workers awake
+                if (now - _STATE.get("last_sentinel_ping", 0)) > 90:
                     _STATE["last_sentinel_ping"] = now
                     asyncio.create_task(_run_sentinel_pings())
 
@@ -276,26 +307,33 @@ async def _sync_loop():
 
         except Exception as e:
             log.error(f"Sync loop error: {e}")
+            await asyncio.sleep(5)
 
 # ── Scan Worker Logic ────────────────────────────────────────────────────────
 
 async def _scan_worker(wid: int):
+    global _queue_lock
+    if _queue_lock is None:
+        _queue_lock = asyncio.Lock()
+
     while _STATE["running"]:
         try:
-            if _STATE["paused"] or _STATE.get("duty_state") == "resting":
+            if _STATE["paused"]:
                 await asyncio.sleep(2)
                 continue
 
             try:
                 username = _scan_queue.get_nowait()
             except asyncio.QueueEmpty:
-                if not _watchlist:
-                    await asyncio.sleep(1)
-                    continue
-                _STATS["rounds"] += 1
-                for u in _watchlist:
-                    await _scan_queue.put(u)
-                await asyncio.sleep(0.05)
+                async with _queue_lock:
+                    if _scan_queue.empty():
+                        if not _watchlist:
+                            await asyncio.sleep(1)
+                            continue
+                        _STATS["rounds"] += 1
+                        for u in _watchlist:
+                            await _scan_queue.put(u)
+                        await asyncio.sleep(0.05)
                 continue
 
             _STATS["checks"] += 1
@@ -329,7 +367,7 @@ async def _scan_worker(wid: int):
                     pass
                 asyncio.create_task(_report_hit(username))
 
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(SCAN_DELAY)
 
         except asyncio.CancelledError:
             break
@@ -373,6 +411,16 @@ def _render_worker_html() -> str:
         if is_hash
         else '<span style="background:#064e3b;color:#6ee7b7;border:1px solid #059669;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;">🎯 DIRECT SCAN</span>'
     )
+
+    duty_badge = ""
+    if _STATE.get("duty_cycle_enabled"):
+        d_state = _STATE.get("duty_state", "direct_ip")
+        rem_m = max(0, int((_STATE.get("cycle_switch_at", 0) - time.time()) / 60))
+        if d_state == "direct_ip":
+            duty_badge = f'<span style="background:#083344;color:#67e8f9;border:1px solid #06b6d4;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;">⚡ DIRECT IP ({rem_m}m)</span>'
+        else:
+            p_cnt = scraper._proxy_pool.stats().get("working", 0)
+            duty_badge = f'<span style="background:#3b0764;color:#d8b4fe;border:1px solid #9333ea;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;">🌐 PROXY SWARM ({rem_m}m • {p_cnt} IPs)</span>'
 
     logs_html = "".join([
         f'<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);font-size:13px;font-family:monospace;">'
@@ -468,6 +516,7 @@ def _render_worker_html() -> str:
     <div class="header">
       <div class="title">HAIDER SNIPER <span>// {html.escape(WORKER_ID.upper())}</span></div>
       <div class="status-group">
+        {duty_badge}
         {mode_badge}
         {upstream_badge}
       </div>
@@ -590,7 +639,7 @@ async def main():
 
     await scraper.init_sessions()
     try:
-        await scraper.init_hash_pool(n_tokens=5)
+        await scraper.init_hash_pool(n=5)
     except Exception as e:
         log.warning(f"Hash pool init warning: {e}")
 
@@ -600,6 +649,10 @@ async def main():
 
     await _start_workers(N_WORKERS)
     asyncio.create_task(_sync_loop())
+    if IS_ENZONIC_DUAL or _STATE.get("duty_cycle_enabled"):
+        log.info("🌐 Launching Autonomous Auto-Proxy Fetcher daemon for background pool warming...")
+        asyncio.create_task(scraper.auto_fetch_proxies_loop(interval_mins=8))
+        asyncio.create_task(scraper.auto_fetch_free_proxies())
 
     while _STATE["running"]:
         await asyncio.sleep(1)
