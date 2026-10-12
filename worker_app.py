@@ -37,7 +37,7 @@ except Exception:
     pass
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAIN_URL      = os.environ.get("MAIN_URL", "https://thomasthere-fragment.hf.space").rstrip("/")
+MAIN_URL      = os.environ.get("MAIN_URL", "http://89.168.111.17:7860").rstrip("/")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "haider_secret_v17")
 _configured_wid = os.environ.get("WORKER_ID")
 if _configured_wid:
@@ -52,8 +52,8 @@ else:
 INITIAL_MODE  = os.environ.get("SCAN_MODE", "hash").lower()
 PORT          = int(float(os.environ.get("PORT", os.environ.get("SERVER_PORT", "7860"))))
 PING_INTERVAL = int(float(os.environ.get("PING_INTERVAL", "15")))
-N_WORKERS     = int(float(os.environ.get("FRAG_WORKERS", "6" if "wisp" in WORKER_ID.lower() else "20")))
-SCAN_DELAY    = float(os.environ.get("SCAN_DELAY", "0.10" if "wisp" in WORKER_ID.lower() else "0.02"))
+N_WORKERS     = int(float(os.environ.get("FRAG_WORKERS", "1" if "wisp" in WORKER_ID.lower() else "20")))
+SCAN_DELAY    = float(os.environ.get("SCAN_DELAY", "0.20" if "wisp" in WORKER_ID.lower() else "0.02"))
 DUTY_CYCLE_MINS = int(float(os.environ.get("DUTY_CYCLE", "30" if "blitz" in WORKER_ID.lower() else "0")))
 
 logging.basicConfig(
@@ -223,8 +223,7 @@ async def _run_sentinel_pings():
     """Pings cluster nodes to prevent idle sleep/inactivity during Blitz rest cycle."""
     sentinel_targets = [
         f"{MAIN_URL}/health",
-        "https://thomasthere-worker-1.hf.space/health",
-        "https://thomasthere-fragment.hf.space/api/stats",
+        f"{MAIN_URL}/api/stats",
     ]
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as sess:
