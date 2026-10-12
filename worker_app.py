@@ -38,6 +38,8 @@ except Exception:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAIN_URL      = os.environ.get("MAIN_URL", "http://89.168.111.17:7860").rstrip("/")
+if not MAIN_URL or "thomasthere" in MAIN_URL or "hf.space" in MAIN_URL:
+    MAIN_URL = "http://89.168.111.17:7860"
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "haider_secret_v17")
 _configured_wid = os.environ.get("WORKER_ID")
 if _configured_wid:
